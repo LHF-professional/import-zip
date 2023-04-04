@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Flask App</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0-beta1/dist/css/bootstrap.min.css" rel="stylesheet"
+          integrity="sha384-0evHe/X+R7YkIZDRvuzKMRqM+OrBnVFBL6DOitfPri4tjfHxaWutUpFmBp4vmVor" crossorigin="anonymous">
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/v/dt/dt-1.12.1/datatables.min.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.3/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div id="container">
+    <img id="image" src="https://via.placeholder.com/350x150" alt="My Image">
+    <div id="buttons">
+        <div id="button_1" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_1') }}, 0)">Button 1</button>
+        </div>
+        <div id="button_2" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_2') }}, 1)">Button 2</button>
+        </div>
+        <div id="button_3" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_3') }}, 2)">Button 3</button>
+        </div>
+        <div id="button_4" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_4') }}, 3)">Button 4</button>
+        </div>
+        <div id="button_5" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_5') }}, 4)">Button 5</button>
+        </div>
+        <div id="button_6" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_6') }}, 5)">Button 6</button>
+        </div>
+        <div id="button_7" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_7') }}, 6)">Button 7</button>
+        </div>
+        <div id="button_8" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_8') }}, 7)">Button 8</button>
+        </div>
+        <div id="button_9" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_9') }}, 8)">Button 9</button>
+        </div>
+        <div id="button_10" class="d-flex align-items-center gap-2">
+            <button class="btn btn-primary" onclick="buttonHandler({{ url_for('button_10') }}, 9)">Button 10</button>
+        </div>
+    </div>
+</div>
+<div class="m-2">
+    <form id="newForm" method="post">
+        <label for="firstInput">A: </label>
+        <input id="firstInput" name="firstInput" type="text">
+
+        <label for="secondInput">B: </label>
+        <input id="secondInput" name="secondInput" type="text">
+
+        <button class="btn btn-primary" type="submit">Submit</button>
+    </form>
+</div>
+<div class="modal" tabindex="-1" id="imageModal">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <img id="modalImage" class="mx-auto text-center d-block" src="" alt="">
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://code.jquery.com/jquery-3.6.0.slim.js"
+        integrity="sha256-HwWONEZrpuoh951cQD1ov2HUK5zA5DwJ1DNUXaM6FsY=" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.0-beta1/dist/js/bootstrap.bundle.min.js"
+        integrity="sha384-pprn3073KE6tl6bjs2QrFaJGz5/SUsLqktiwsUTF55Jfv3qYSDhgCecCxMW52nD2"
+        crossorigin="anonymous"></script>
+<script type="text/javascript" src="https://cdn.datatables.net/v/dt/dt-1.12.1/datatables.min.js"></script>
+<script src="https://unpkg.com/css-doodle@0.34.6/css-doodle.min.js"></script>
+
+<script>
+    function buttonHandler(url, buttonIndex) {
+        disableButtons(buttonIndex)
+        addDoodle(buttonIndex)
+        removeTick(buttonIndex)
+        removeError(buttonIndex)
+        removeImage(buttonIndex)
+        fetch(url)
+            .then(response => response.json())
+            .then(data => {
+                console.log(data)
+                enableButtons()
+                removeDoodle(buttonIndex)
+                if (data.status === 400) {
+                    addError(buttonIndex, ' Error: ' + data.message)
+                } else {
+                    addTick(buttonIndex)
+                    if (buttonIndex > 1 && buttonIndex < 9) {
+                        let images = data.images
+                        console.log(images)
+                        images.forEach(image => {
+                            console.log(image)
+                            addImage(buttonIndex, image)
+                        })
+                    }
+                }
+
+            })
+    }
+
+    // function to disable all buttons except the given index
+    function disableButtons(index) {
+        let buttons = document.getElementById("buttons").getElementsByTagName("button");
+        for (let i = 0; i < buttons.length; i++) {
+            if (i !== index) {
+                buttons[i].disabled = true;
+            }
+        }
+    }
+
+    // function to enable all buttons
+    function enableButtons() {
+        let buttons = document.getElementById("buttons").getElementsByTagName("button");
+        for (let i = 0; i < buttons.length; i++) {
+            buttons[i].disabled = false;
+        }
+    }
+
+    // function to add a doodle inside the button_id div at the given index
+    function addDoodle(index) {
+        let buttons = document.getElementById("buttons").children;
+        let doodle = document.createElement("css-doodle");
+        doodle.innerHTML = `<css-doodle>
+        :doodle {
+        @grid: 8 / 90%;
+        @shape: square;
+        @size: 6em 2.5em;
+        @animation: infinite;
+        }
+
+        transition: .2s @r(.6s);
+        border-radius: @pick(100% 0, 0 100%);
+        transform: scale(@r(.25, 1.25));
+
+        background: hsla(
+        calc(240 - 6 * @x * @y),
+        70%, 68%, @r.8
+        );
+    </css-doodle>`;
+        buttons[index].appendChild(doodle);
+    }
+
+
+    // function to remove css-doodle
+    function removeDoodle(index) {
+        let buttons = document.getElementById("buttons").children;
+        let doodles = buttons[index].getElementsByTagName("css-doodle");
+        for (let i = 0; i < doodles.length; i++) {
+            buttons[index].removeChild(doodles[i]);
+        }
+    }
+
+    // function to add a green tick next to the button
+    function addTick(index) {
+        let buttons = document.getElementById("buttons").children;
+        let tick = document.createElement("i");
+        tick.className = "bi bi-check-circle-fill";
+        tick.style.color = "green";
+        buttons[index].appendChild(tick);
+    }
+
+    // function to remove green tick
+    function removeTick(index) {
+        let buttons = document.getElementById("buttons").children;
+        let ticks = buttons[index].getElementsByTagName("i");
+        for (let i = 0; i < ticks.length; i++) {
+            if (ticks[i].className === "bi bi-check-circle-fill") {
+                buttons[index].removeChild(ticks[i]);
+            }
+        }
+    }
+
+    // function to display an error message next to the button
+    function addError(index, errorMessage) {
+        let buttons = document.getElementById("buttons").children;
+        let error = document.createElement("i");
+        error.className = "bi bi-x-circle-fill";
+        error.style.color = "red";
+        error.textContent = errorMessage
+        buttons[index].appendChild(error);
+    }
+
+    // function to remove error message
+    function removeError(index) {
+        let buttons = document.getElementById("buttons").children;
+        let errors = buttons[index].getElementsByTagName("i");
+        for (let i = 0; i < errors.length; i++) {
+            if (errors[i].className === "bi bi-x-circle-fill") {
+                buttons[index].removeChild(errors[i]);
+            }
+        }
+    }
+
+    // function to add an image next to the button
+    function addImage(index, imageSrc) {
+        let buttons = document.getElementById("buttons").children;
+
+        let image = document.createElement("img");
+        image.src = "/static/" + imageSrc;
+        image.style.width = "20px";
+        image.style.height = "20px";
+        image.id = "image_" + index;
+        image.addEventListener("click", function () {
+            let modal_img = document.getElementById("modalImage");
+            modal_img.src = image.src;
+            modal_img.alt = image.id;
+            let imageModal = new bootstrap.Modal('#imageModal', {
+                keyboard: false
+            })
+            imageModal.show()
+        })
+        buttons[index].appendChild(image);
+    }
+
+    function removeImage(index) {
+        let buttons = document.getElementById("buttons").children;
+        let images = [...buttons[index].getElementsByTagName("img")];
+        for (let i = 0; i < images.length; i++) {
+            console.log(images[i])
+            buttons[index].removeChild(images[i]);
+        }
+    }
+
+    // function to close the app by sending a post request to the url
+    function closeApp(url) {
+        fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                "status": "shutdown"
+            })
+        })
+        window.close()
+    }
+</script>
+
+{% block extraJs %}{% endblock %}
+</body>
+</html>
