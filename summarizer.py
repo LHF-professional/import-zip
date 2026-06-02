@@ -6,12 +6,19 @@ Usage:
   python summarizer.py --setup <NOTION_PARENT_PAGE_ID>   # create Notion DB
   python summarizer.py                                   # run bot
 
-Forcer le type ambiguë : "film: Dune" / "livre: Dune" / "concept: Dune"
+Inputs acceptés :
+  - URL d'article
+  - Lien magnet  (magnet:?xt=urn:btih:...)
+  - Fichier .torrent envoyé en pièce jointe Telegram
+  - film: <titre>  /  livre: <titre>  /  concept: <sujet>
 
 Env vars required:
   TELEGRAM_TOKEN, OPENAI_API_KEY, NOTION_TOKEN, NOTION_DATABASE_ID
 Optional:
-  TMDB_API_KEY, GOOGLE_BOOKS_API_KEY
+  TMDB_API_KEY, GOOGLE_BOOKS_API_KEY, TORRENT_TIMEOUT (défaut: 300s)
+
+Dépendances système :
+  apt install aria2
 """
 
 import os
@@ -21,6 +28,8 @@ import hashlib
 import logging
 import argparse
 import re
+import subprocess
+import tempfile
 import time
 from datetime import datetime, date
 from html.parser import HTMLParser
@@ -39,6 +48,7 @@ NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
+TORRENT_TIMEOUT = int(os.environ.get("TORRENT_TIMEOUT", "300"))
 
 CACHE_FILE = Path("cache.json")
 MAX_ARTICLE_CHARS = 32000  # ~8000 tokens
@@ -73,12 +83,20 @@ _TYPE_MAP = {
 
 def classify(text):
     """Returns (content_type, identifier).
-    content_type can be 'ambiguous' if no explicit prefix and not a URL.
+    content_type can be 'ambiguous' if no explicit prefix and not a URL/magnet.
     """
     text = text.strip()
+    # Explicit prefix: film:/livre:/concept:/article:
     m = re.match(r'^(film|movie|livre|book|concept|article)\s*:\s*(.+)$', text, re.IGNORECASE)
     if m:
         return _TYPE_MAP[m.group(1).lower()], m.group(2).strip()
+    # Magnet link
+    if re.match(r'magnet:\?', text, re.IGNORECASE):
+        return "torrent", text
+    # .torrent file path (set by document handler)
+    if text.endswith(".torrent") and os.path.exists(text):
+        return "torrent", text
+    # HTTP(S) article
     if re.match(r'https?://', text):
         return "article", text
     return "ambiguous", text
@@ -159,6 +177,70 @@ def enrich_book(title):
     }
 
 
+# ─── Torrent fetch ─────────────────────────────────────────────────────────────
+
+def fetch_torrent(magnet_or_torrent_path):
+    """Download via aria2c with seeding fully disabled. Returns extracted text."""
+    with tempfile.TemporaryDirectory(prefix="summarizer_") as tmpdir:
+        cmd = [
+            "aria2c",
+            "--seed-time=0",           # stop seeding immediately after download
+            "--bt-max-upload-slots=0", # no upload slots allocated
+            "--max-upload-limit=1",    # hard cap 1 byte/s (belt + suspenders)
+            "--dir", tmpdir,
+            "--quiet",
+            "--console-log-level=warn",
+            magnet_or_torrent_path,
+        ]
+        subprocess.run(cmd, timeout=TORRENT_TIMEOUT, check=True)
+        return _extract_from_dir(tmpdir)
+
+
+def _extract_from_dir(directory):
+    all_files = []
+    for root, _, files in os.walk(directory):
+        for f in files:
+            all_files.append(os.path.join(root, f))
+
+    if not all_files:
+        raise ValueError("Aucun fichier téléchargé")
+
+    for ext in (".epub", ".pdf", ".txt", ".text", ".md"):
+        matches = [f for f in all_files if f.lower().endswith(ext)]
+        if matches:
+            return _extract_text_file(matches[0])
+
+    names = [os.path.basename(f) for f in all_files]
+    raise ValueError(f"Format non supporté parmi : {names}")
+
+
+def _extract_text_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        return _extract_pdf(path)
+    if ext == ".epub":
+        return _extract_epub(path)
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        return f.read()[:MAX_ARTICLE_CHARS]
+
+
+def _extract_pdf(path):
+    from pdfminer.high_level import extract_text as pdf_to_text
+    return (pdf_to_text(path) or "")[:MAX_ARTICLE_CHARS]
+
+
+def _extract_epub(path):
+    import ebooklib
+    from ebooklib import epub as epub_lib
+    book = epub_lib.read_epub(path, options={"ignore_ncx": True})
+    parts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        p = _TextExtractor()
+        p.feed(item.get_content().decode("utf-8", errors="ignore"))
+        parts.append(" ".join(p.texts))
+    return " ".join(parts)[:MAX_ARTICLE_CHARS]
+
+
 # ─── LLM summary ─────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
@@ -185,17 +267,18 @@ Schéma JSON à respecter exactement :
 RÈGLES CRITIQUES :
 - best_quote.is_real_quote = false TOUJOURS (ne jamais inventer une citation textuelle)
 - personal_interpretation_draft commence TOUJOURS par "[BROUILLON] "
-- Pour livres/films : ne jamais citer du texte intégral de l'œuvre
 - related_draft : titres ou concepts liés, sans certitude requise
 """
 
 
 def _build_user_prompt(content_type, identifier, enriched):
-    if content_type == "article":
-        return (
-            f"Résume cet article.\nURL: {identifier}\n\nContenu:\n"
-            + enriched.get("content", "")
+    if content_type in ("article", "torrent"):
+        intro = (
+            "Résume cet article.\nURL: " + identifier
+            if content_type == "article"
+            else "Identifie et résume ce document (livre, film, concept ou article) pour une fiche Notion."
         )
+        return intro + "\n\nContenu:\n" + enriched.get("content", "")
     if content_type == "film":
         return (
             f"Résume ce film pour une fiche Notion personnelle.\n"
@@ -394,7 +477,7 @@ def process(text):
     """
     Full pipeline for a user message.
     Returns (notion_url, from_cache, content_type, identifier).
-    content_type == 'ambiguous' means needs clarification (notion_url is None).
+    content_type == 'ambiguous' → needs clarification, notion_url is None.
     """
     content_type, identifier = classify(text)
 
@@ -409,6 +492,8 @@ def process(text):
     enriched = {}
     if content_type == "article":
         enriched["content"] = fetch_article(identifier)
+    elif content_type == "torrent":
+        enriched["content"] = fetch_torrent(identifier)
     elif content_type == "film":
         enriched = enrich_film(identifier)
     elif content_type == "livre":
@@ -439,6 +524,8 @@ logger = logging.getLogger(__name__)
 _HELP = (
     "Envoie-moi :\n"
     "• Une URL d'article\n"
+    "• Un lien magnet (magnet:?...)\n"
+    "• Un fichier .torrent en pièce jointe\n"
     "• `film: <titre>` · `livre: <titre>` · `concept: <sujet>`\n\n"
     "Pour lever une ambiguïté :\n"
     "  `film: Dune`  vs  `livre: Dune`"
@@ -449,15 +536,39 @@ _LABELS = {
     "film": "🎬 Film",
     "livre": "📚 Livre",
     "concept": "💡 Concept",
+    "torrent": "🧲 Torrent",
 }
 
 
-async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text or text in ("/start", "/help"):
         await update.message.reply_text(_HELP)
         return
+    await _run_pipeline(update, text)
 
+
+async def _handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not (doc.file_name or "").endswith(".torrent"):
+        await update.message.reply_text("❌ Seuls les fichiers .torrent sont acceptés.")
+        return
+
+    tg_file = await context.bot.get_file(doc.file_id)
+    with tempfile.NamedTemporaryFile(suffix=".torrent", delete=False) as tmp:
+        await tg_file.download_to_drive(tmp.name)
+        torrent_path = tmp.name
+
+    try:
+        await _run_pipeline(update, torrent_path)
+    finally:
+        try:
+            os.unlink(torrent_path)
+        except OSError:
+            pass
+
+
+async def _run_pipeline(update: Update, text: str):
     await update.message.reply_text("⏳ Traitement en cours…")
     t0 = time.monotonic()
     try:
@@ -488,7 +599,8 @@ async def _handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def run_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT, _handle))
+    app.add_handler(MessageHandler(filters.TEXT, _handle_text))
+    app.add_handler(MessageHandler(filters.Document.FileExtension("torrent"), _handle_document))
     logger.info("Summarizer bot started")
     app.run_polling()
 
