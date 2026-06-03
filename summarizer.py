@@ -9,10 +9,12 @@ Usage:
 Inputs acceptés :
   URL                          → fetch direct + Wayback fallback
   article: <URL>               → idem
-  article: <mots-clés>         → recherche via GPT web search
-  magnet:?...                  → torrent (aria2c, seed désactivé)
-  fichier .torrent en PJ        → idem
-  film: / livre: / concept:    → TMDB / Google Books / LLM
+  article: <mots-clés>         → GPT web search (gpt-4o-search-preview)
+  livre: <titre>               → Google Books (metadata) + Libgen (texte complet)
+  film: <titre>                → TMDB metadata + LLM
+  concept: <sujet>             → LLM connaissance publique
+  magnet:?...                  → aria2c seed=0 → extract
+  fichier .torrent en PJ       → idem
 
 Env vars required:
   TELEGRAM_TOKEN, OPENAI_API_KEY, NOTION_TOKEN, NOTION_DATABASE_ID
@@ -43,16 +45,18 @@ import openai
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
-TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
-OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
-NOTION_TOKEN       = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
+TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
+OPENAI_API_KEY      = os.environ["OPENAI_API_KEY"]
+NOTION_TOKEN        = os.environ["NOTION_TOKEN"]
+NOTION_DATABASE_ID  = os.environ.get("NOTION_DATABASE_ID", "")
 TMDB_API_KEY        = os.environ.get("TMDB_API_KEY", "")
 GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
-TORRENT_TIMEOUT    = int(os.environ.get("TORRENT_TIMEOUT", "300"))
+TORRENT_TIMEOUT     = int(os.environ.get("TORRENT_TIMEOUT", "300"))
 
-CACHE_FILE       = Path("cache.json")
+CACHE_FILE        = Path("cache.json")
 MAX_ARTICLE_CHARS = 32000  # ~8000 tokens
+
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; summarizer-bot/1.0)"}
 
 
 # ─── Cache ───────────────────────────────────────────────────────────────────
@@ -62,10 +66,8 @@ def _load_cache():
         return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
     return {}
 
-
 def _save_cache(cache):
     CACHE_FILE.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
-
 
 def _cache_key(content_type, identifier):
     raw = f"{content_type}:{identifier.lower().strip()}"
@@ -75,47 +77,27 @@ def _cache_key(content_type, identifier):
 # ─── Classification ──────────────────────────────────────────────────────────
 
 _TYPE_MAP = {
-    "film": "film",    "movie": "film",
-    "livre": "livre",  "book": "livre",
+    "film": "film",   "movie": "film",
+    "livre": "livre", "book": "livre",
     "concept": "concept",
     "article": "article",
 }
 
-
 def classify(text):
-    """
-    Returns (content_type, identifier).
-
-    content_types:
-      article        → HTTP URL, fetch direct + Wayback fallback
-      article_search → keywords, find via GPT web search
-      torrent        → magnet link or .torrent file path
-      film/livre/concept → metadata enrichment
-      ambiguous      → ask user to clarify
-    """
     text = text.strip()
-
-    # Explicit prefix
     m = re.match(r'^(film|movie|livre|book|concept|article)\s*:\s*(.+)$', text, re.IGNORECASE)
     if m:
-        kind = _TYPE_MAP[m.group(1).lower()]
+        kind       = _TYPE_MAP[m.group(1).lower()]
         identifier = m.group(2).strip()
         if kind == "article" and not re.match(r'https?://', identifier):
-            return "article_search", identifier   # keywords, not a URL
+            return "article_search", identifier
         return kind, identifier
-
-    # Bare HTTP(S) URL
     if re.match(r'https?://', text):
         return "article", text
-
-    # Magnet link
     if re.match(r'magnet:\?', text, re.IGNORECASE):
         return "torrent", text
-
-    # .torrent file path set by document handler
     if text.endswith(".torrent") and os.path.exists(text):
         return "torrent", text
-
     return "ambiguous", text
 
 
@@ -123,28 +105,18 @@ def classify(text):
 
 class _TextExtractor(HTMLParser):
     _SKIP = {"script", "style", "nav", "header", "footer", "aside"}
-
     def __init__(self):
         super().__init__()
         self._depth = 0
-        self.texts = []
-
+        self.texts  = []
     def handle_starttag(self, tag, attrs):
-        if tag in self._SKIP:
-            self._depth += 1
-
+        if tag in self._SKIP: self._depth += 1
     def handle_endtag(self, tag):
-        if tag in self._SKIP and self._depth:
-            self._depth -= 1
-
+        if tag in self._SKIP and self._depth: self._depth -= 1
     def handle_data(self, data):
         if not self._depth:
             s = data.strip()
-            if s:
-                self.texts.append(s)
-
-
-# ─── Article fetch (URL) ─────────────────────────────────────────────────────────
+            if s: self.texts.append(s)
 
 def _html_to_text(html):
     p = _TextExtractor()
@@ -152,14 +124,12 @@ def _html_to_text(html):
     return " ".join(p.texts)[:MAX_ARTICLE_CHARS]
 
 
+# ─── Article fetch (URL + Wayback fallback) ──────────────────────────────────────
+
 def _wayback_url(url):
-    """Return the closest Wayback Machine snapshot URL, or None."""
     try:
-        r = requests.get(
-            "https://archive.org/wayback/available",
-            params={"url": url},
-            timeout=10,
-        )
+        r    = requests.get("https://archive.org/wayback/available",
+                            params={"url": url}, timeout=10)
         snap = r.json().get("archived_snapshots", {}).get("closest", {})
         if snap.get("available"):
             return snap["url"]
@@ -167,31 +137,25 @@ def _wayback_url(url):
         pass
     return None
 
-
 def _fetch_raw(url):
-    resp = requests.get(
-        url, timeout=12,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; summarizer-bot/1.0)"}
-    )
+    resp = requests.get(url, timeout=12, headers=_HEADERS)
     resp.raise_for_status()
     return _html_to_text(resp.text)
 
-
 def fetch_article(url):
-    """Fetch article text from URL. Falls back to Wayback Machine on error."""
     try:
         return _fetch_raw(url)
-    except Exception as primary_err:
+    except Exception as err:
         archived = _wayback_url(url)
         if archived:
             try:
                 return _fetch_raw(archived)
             except Exception:
                 pass
-        raise primary_err
+        raise err
 
 
-# ─── Article search (keywords) ───────────────────────────────────────────────────
+# ─── Article search (keywords → GPT web search) ─────────────────────────────────
 
 _SEARCH_PROMPT = """\
 Find the following article and return its full content.
@@ -206,12 +170,7 @@ CONTENT:
 <full article text>
 """
 
-
 def fetch_article_by_keywords(keywords):
-    """
-    Find and retrieve an article from keywords using GPT web search.
-    Returns dict: {content, url, title, author, date}
-    """
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
     resp = client.chat.completions.create(
         model="gpt-4o-search-preview",
@@ -224,25 +183,120 @@ def fetch_article_by_keywords(keywords):
         m = re.search(pattern, raw, re.IGNORECASE)
         return m.group(1).strip() if m else ""
 
-    content_match = re.search(r'CONTENT:\n(.+)', raw, re.DOTALL | re.IGNORECASE)
+    content_m = re.search(r'CONTENT:\n(.+)', raw, re.DOTALL | re.IGNORECASE)
     return {
-        "content":  (content_match.group(1).strip() if content_match else raw)[:MAX_ARTICLE_CHARS],
-        "url":    _field(r'SOURCE_URL:\s*(\S+)'),
-        "title":  _field(r'TITLE:\s*(.+)'),
-        "author": _field(r'AUTHOR:\s*(.+)'),
-        "date":   _field(r'DATE:\s*(\S+)'),
+        "content": (content_m.group(1).strip() if content_m else raw)[:MAX_ARTICLE_CHARS],
+        "url":     _field(r'SOURCE_URL:\s*(\S+)'),
+        "title":   _field(r'TITLE:\s*(.+)'),
+        "author":  _field(r'AUTHOR:\s*(.+)'),
+        "date":    _field(r'DATE:\s*(\S+)'),
     }
 
 
-# ─── Film / book enrichment ──────────────────────────────────────────────────────
+# ─── Book: Google Books (metadata) + Libgen (full text) ─────────────────────────
+
+def enrich_book(title):
+    """Google Books: metadata + ISBN."""
+    params = {"q": title, "maxResults": 1}
+    if GOOGLE_BOOKS_API_KEY:
+        params["key"] = GOOGLE_BOOKS_API_KEY
+    r    = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
+    items = r.json().get("items", [])
+    if not items:
+        return {}
+    info = items[0].get("volumeInfo", {})
+    idents = info.get("industryIdentifiers", [])
+    isbn   = next((x["identifier"] for x in idents
+                   if x["type"] in ("ISBN_13", "ISBN_10")), "")
+    return {
+        "title":       info.get("title", title),
+        "author":      ", ".join(info.get("authors", [])),
+        "year":        (info.get("publishedDate") or "")[:4],
+        "description": info.get("description", ""),
+        "source":      info.get("infoLink", ""),
+        "isbn":        isbn,
+    }
+
+
+def _libgen_search(query):
+    """
+    Search libgen, return list of dicts {id, title, author, extension, md5}.
+    Uses HTML search + JSON metadata API.
+    """
+    r = requests.get(
+        "http://libgen.rs/search.php",
+        params={"req": query, "res": 5, "view": "simple", "phrase": 1, "column": "def"},
+        timeout=15, headers=_HEADERS,
+    )
+    # Extract numeric IDs from the result table (7+ digit numbers in <td>)
+    ids = re.findall(r'<td>\s*(\d{7,})\s*</td>', r.text)
+    if not ids:
+        return []
+    # Fetch metadata for found IDs via JSON API
+    r2 = requests.get(
+        "http://libgen.rs/json.php",
+        params={"ids": ",".join(ids[:5]), "fields": "id,title,author,year,extension,md5"},
+        timeout=10,
+    )
+    return r2.json()
+
+
+def _libgen_download_url(md5):
+    """
+    Get a direct download URL from library.lol for a given MD5.
+    Returns URL string or None.
+    """
+    page = requests.get(f"https://library.lol/main/{md5}", timeout=12, headers=_HEADERS)
+    # The page contains a prominent GET link
+    m = re.search(r'href="(https?://[^"]+)"[^>]*>\s*GET\s*</a>', page.text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Fallback: any libgen mirror direct link
+    m = re.search(r'href="(https?://[^"]*get\.php[^"]*md5=[^"]+)"', page.text, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def fetch_book_content(title, author="", isbn=""):
+    """
+    Find book on libgen (prefer epub > pdf), download, extract text.
+    Returns extracted text string.
+    Raises ValueError if not found or format unsupported.
+    """
+    query   = isbn if isbn else f"{title} {author}".strip()
+    results = _libgen_search(query)
+    if not results:
+        raise ValueError(f"Livre introuvable sur libgen : {query}")
+
+    # Prefer epub, then pdf
+    results.sort(key=lambda b: ({"epub": 0, "pdf": 1}.get(b.get("extension", "").lower(), 2)))
+    book = results[0]
+
+    dl_url = _libgen_download_url(book.get("md5", ""))
+    if not dl_url:
+        raise ValueError(f"Lien de téléchargement introuvable (MD5={book.get('md5', '')})")
+
+    ext = book.get("extension", "pdf").lower()
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        resp = requests.get(dl_url, timeout=60, stream=True, headers=_HEADERS)
+        resp.raise_for_status()
+        for chunk in resp.iter_content(8192):
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        return _extract_text_file(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+
+# ─── Film enrichment ─────────────────────────────────────────────────────────────
 
 def enrich_film(title):
     if not TMDB_API_KEY:
         return {}
     r = requests.get(
         "https://api.themoviedb.org/3/search/movie",
-        params={"api_key": TMDB_API_KEY, "query": title},
-        timeout=10,
+        params={"api_key": TMDB_API_KEY, "query": title}, timeout=10,
     )
     results = r.json().get("results", [])
     if not results:
@@ -256,42 +310,17 @@ def enrich_film(title):
     }
 
 
-def enrich_book(title):
-    params = {"q": title, "maxResults": 1}
-    if GOOGLE_BOOKS_API_KEY:
-        params["key"] = GOOGLE_BOOKS_API_KEY
-    r = requests.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=10)
-    items = r.json().get("items", [])
-    if not items:
-        return {}
-    info = items[0].get("volumeInfo", {})
-    return {
-        "title":       info.get("title", title),
-        "author":      ", ".join(info.get("authors", [])),
-        "year":        (info.get("publishedDate") or "")[:4],
-        "description": info.get("description", ""),
-        "source":      info.get("infoLink", ""),
-    }
-
-
 # ─── Torrent fetch ─────────────────────────────────────────────────────────────
 
-def fetch_torrent(magnet_or_torrent_path):
-    """Download via aria2c with seeding fully disabled. Returns extracted text."""
+def fetch_torrent(magnet_or_path):
     with tempfile.TemporaryDirectory(prefix="summarizer_") as tmpdir:
-        cmd = [
+        subprocess.run([
             "aria2c",
-            "--seed-time=0",
-            "--bt-max-upload-slots=0",
-            "--max-upload-limit=1",
-            "--dir", tmpdir,
-            "--quiet",
-            "--console-log-level=warn",
-            magnet_or_torrent_path,
-        ]
-        subprocess.run(cmd, timeout=TORRENT_TIMEOUT, check=True)
+            "--seed-time=0", "--bt-max-upload-slots=0", "--max-upload-limit=1",
+            "--dir", tmpdir, "--quiet", "--console-log-level=warn",
+            magnet_or_path,
+        ], timeout=TORRENT_TIMEOUT, check=True)
         return _extract_from_dir(tmpdir)
-
 
 def _extract_from_dir(directory):
     all_files = []
@@ -301,31 +330,26 @@ def _extract_from_dir(directory):
     if not all_files:
         raise ValueError("Aucun fichier téléchargé")
     for ext in (".epub", ".pdf", ".txt", ".text", ".md"):
-        matches = [f for f in all_files if f.lower().endswith(ext)]
-        if matches:
-            return _extract_text_file(matches[0])
+        hits = [f for f in all_files if f.lower().endswith(ext)]
+        if hits:
+            return _extract_text_file(hits[0])
     raise ValueError(f"Format non supporté : {[os.path.basename(f) for f in all_files]}")
-
 
 def _extract_text_file(path):
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        return _extract_pdf(path)
-    if ext == ".epub":
-        return _extract_epub(path)
+    if ext == ".pdf":  return _extract_pdf(path)
+    if ext == ".epub": return _extract_epub(path)
     with open(path, encoding="utf-8", errors="ignore") as f:
         return f.read()[:MAX_ARTICLE_CHARS]
 
-
 def _extract_pdf(path):
-    from pdfminer.high_level import extract_text as pdf_to_text
-    return (pdf_to_text(path) or "")[:MAX_ARTICLE_CHARS]
-
+    from pdfminer.high_level import extract_text as _pdf
+    return (_pdf(path) or "")[:MAX_ARTICLE_CHARS]
 
 def _extract_epub(path):
     import ebooklib
     from ebooklib import epub as epub_lib
-    book = epub_lib.read_epub(path, options={"ignore_ncx": True})
+    book  = epub_lib.read_epub(path, options={"ignore_ncx": True})
     parts = []
     for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
         p = _TextExtractor()
@@ -363,7 +387,6 @@ RÈGLES CRITIQUES :
 - related_draft : titres ou concepts liés, sans certitude requise
 """
 
-
 def _build_user_prompt(content_type, identifier, enriched):
     if content_type == "article":
         return (
@@ -371,20 +394,36 @@ def _build_user_prompt(content_type, identifier, enriched):
             + enriched.get("content", "")
         )
     if content_type == "article_search":
-        meta = (
+        return (
+            f"Résume cet article (trouvé par recherche web).\n"
             f"Titre: {enriched.get('title', identifier)}\n"
             f"Auteur: {enriched.get('author', '')}\n"
             f"Date: {enriched.get('date', '')}\n"
-            f"URL source: {enriched.get('url', '')}\n"
-        )
-        return (
-            f"Résume cet article (trouvé par recherche web).\n{meta}\nContenu:\n"
+            f"URL: {enriched.get('url', '')}\n\nContenu:\n"
             + enriched.get("content", "")
+        )
+    if content_type == "livre":
+        if enriched.get("content"):
+            # Full text available from libgen
+            return (
+                f"Résume ce livre.\n"
+                f"Titre: {enriched.get('title', identifier)}\n"
+                f"Auteur: {enriched.get('author', '')}\n"
+                f"Année: {enriched.get('year', '')}\n\n"
+                f"Contenu (texte intégral, tronqué à 32k caractères):\n"
+                + enriched["content"]
+            )
+        # Fallback: metadata only
+        return (
+            f"Résume ce livre pour une fiche Notion personnelle.\n"
+            f"Titre: {enriched.get('title', identifier)}\n"
+            f"Auteur: {enriched.get('author', '')}\n"
+            f"Année: {enriched.get('year', '')}\n"
+            f"Description: {enriched.get('description', '')}"
         )
     if content_type == "torrent":
         return (
-            "Identifie et résume ce document (livre, film, concept ou article) "
-            "pour une fiche Notion.\n\nContenu:\n"
+            "Identifie et résume ce document (livre, film, concept ou article).\n\nContenu:\n"
             + enriched.get("content", "")
         )
     if content_type == "film":
@@ -394,20 +433,11 @@ def _build_user_prompt(content_type, identifier, enriched):
             f"Année: {enriched.get('year', '')}\n"
             f"Synopsis: {enriched.get('overview', '')}"
         )
-    if content_type == "livre":
-        return (
-            f"Résume ce livre pour une fiche Notion personnelle.\n"
-            f"Titre: {enriched.get('title', identifier)}\n"
-            f"Auteur: {enriched.get('author', '')}\n"
-            f"Année: {enriched.get('year', '')}\n"
-            f"Description: {enriched.get('description', '')}"
-        )
     return f"Explique ce concept pour une fiche Notion personnelle.\nConcept: {identifier}"
-
 
 def summarize_with_llm(content_type, identifier, enriched):
     client = openai.OpenAI(api_key=OPENAI_API_KEY)
-    resp = client.chat.completions.create(
+    resp   = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
@@ -423,98 +453,67 @@ def summarize_with_llm(content_type, identifier, enriched):
 
 _NOTION_API = "https://api.notion.com/v1"
 
-
 def _notion_headers():
-    return {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"}
 
-
-def _rt(text):
-    return [{"type": "text", "text": {"content": str(text)[:2000]}}]
-
-def _heading(text, level=2):
-    key = f"heading_{level}"
-    return {"object": "block", "type": key, key: {"rich_text": _rt(text)}}
-
-def _para(text):
-    return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": _rt(text)}}
-
-def _bullet(text):
-    return {"object": "block", "type": "bulleted_list_item",
-            "bulleted_list_item": {"rich_text": _rt(text)}}
-
-def _todo(text):
-    return {"object": "block", "type": "to_do",
-            "to_do": {"rich_text": _rt(text), "checked": False}}
-
-def _quote(text):
-    return {"object": "block", "type": "quote", "quote": {"rich_text": _rt(text)}}
-
-def _toggle(text, children):
-    return {"object": "block", "type": "toggle",
-            "toggle": {"rich_text": _rt(text), "children": children}}
-
-def _callout(text, emoji="✏️"):
-    return {"object": "block", "type": "callout",
-            "callout": {"rich_text": _rt(text), "icon": {"type": "emoji", "emoji": emoji}}}
-
+def _rt(t):      return [{"type":"text","text":{"content":str(t)[:2000]}}]
+def _heading(t, level=2):
+    k = f"heading_{level}"
+    return {"object":"block","type":k,k:{"rich_text":_rt(t)}}
+def _para(t):    return {"object":"block","type":"paragraph","paragraph":{"rich_text":_rt(t)}}
+def _bullet(t):  return {"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":_rt(t)}}
+def _todo(t):    return {"object":"block","type":"to_do","to_do":{"rich_text":_rt(t),"checked":False}}
+def _quote(t):   return {"object":"block","type":"quote","quote":{"rich_text":_rt(t)}}
+def _toggle(t, children): return {"object":"block","type":"toggle","toggle":{"rich_text":_rt(t),"children":children}}
+def _callout(t, emoji="✏️"): return {"object":"block","type":"callout","callout":{"rich_text":_rt(t),"icon":{"type":"emoji","emoji":emoji}}}
 
 def _build_notion_page(db_id, summary):
-    meta = summary.get("metadata", {})
-    title = meta.get("title") or summary.get("very_short", "Untitled")
+    meta     = summary.get("metadata", {})
+    title    = meta.get("title") or summary.get("very_short", "Untitled")
     year_str = meta.get("year", "")
     year_num = int(year_str) if year_str and year_str.isdigit() else None
 
     props = {
-        "Name":         {"title": _rt(title)},
-        "Content Type": {"select": {"name": summary.get("content_type", "concept").capitalize()}},
-        "Domain":       {"select": {"name": summary.get("domain", "Général")}},
-        "Status":       {"select": {"name": "À lire"}},
-        "Priority":     {"select": {"name": "Moyenne"}},
-        "Date Consumed": {"date": {"start": date.today().isoformat()}},
+        "Name":          {"title": _rt(title)},
+        "Content Type":  {"select": {"name": summary.get("content_type","concept").capitalize()}},
+        "Domain":        {"select": {"name": summary.get("domain","Général")}},
+        "Status":        {"select": {"name": "À lire"}},
+        "Priority":      {"select": {"name": "Moyenne"}},
+        "Date Consumed": {"date":   {"start": date.today().isoformat()}},
     }
-    if meta.get("author"):  props["Author"] = {"rich_text": _rt(meta["author"])}
-    if year_num:            props["Year"]   = {"number": year_num}
+    if meta.get("author"): props["Author"] = {"rich_text": _rt(meta["author"])}
+    if year_num:           props["Year"]   = {"number": year_num}
     if meta.get("source"): props["Source"] = {"url": meta["source"][:2000]}
-    if summary.get("tags"): props["Tags"]  = {"multi_select": [{"name": t} for t in summary["tags"][:5]]}
+    if summary.get("tags"): props["Tags"]  = {"multi_select": [{"name":t} for t in summary["tags"][:5]]}
 
-    bq = summary.get("best_quote", {})
+    bq         = summary.get("best_quote", {})
     quote_text = bq.get("text", "")
     if quote_text and not bq.get("is_real_quote", True):
         quote_text += " *(non vérifié)*"
 
     children = [
-        _heading("Overview"),
-        _para(summary.get("very_short", "")),
-        _para(summary.get("main_summary", "")),
+        _heading("Overview"), _para(summary.get("very_short","")), _para(summary.get("main_summary","")),
         _heading("Key Ideas"),
     ]
-    for idea in summary.get("key_ideas", []):
-        children.append(_toggle(idea.get("theme", ""), [_bullet(p) for p in idea.get("points", [])]))
+    for idea in summary.get("key_ideas",[]):
+        children.append(_toggle(idea.get("theme",""), [_bullet(p) for p in idea.get("points",[])]))
 
     children.append(_heading("Keywords"))
-    for kw in summary.get("keywords", []):   children.append(_bullet(kw))
-
+    for kw in summary.get("keywords",[]): children.append(_bullet(kw))
     children.append(_heading("Useful Concepts"))
-    for c in summary.get("useful_concepts", []): children.append(_bullet(c))
-
+    for c  in summary.get("useful_concepts",[]): children.append(_bullet(c))
     children.append(_heading("Actionable"))
-    for a in summary.get("actionable", []):  children.append(_todo(a))
-
+    for a  in summary.get("actionable",[]): children.append(_todo(a))
     children += [
-        _heading("Best Quote / Moment"),
-        _quote(quote_text),
+        _heading("Best Quote / Moment"), _quote(quote_text),
         _heading("Personal Interpretation"),
-        _callout(summary.get("personal_interpretation_draft", "[BROUILLON] À compléter."), "✏️"),
+        _callout(summary.get("personal_interpretation_draft","[BROUILLON] À compléter."),"✏️"),
         _heading("Related Notes"),
     ]
-    for r in summary.get("related_draft", []):  children.append(_bullet(r))
-
-    return {"parent": {"database_id": db_id}, "properties": props, "children": children}
-
+    for r in summary.get("related_draft",[]): children.append(_bullet(r))
+    return {"parent":{"database_id":db_id},"properties":props,"children":children}
 
 def _create_notion_page(db_id, summary):
     payload = _build_notion_page(db_id, summary)
@@ -522,101 +521,92 @@ def _create_notion_page(db_id, summary):
     r.raise_for_status()
     return r.json()["url"]
 
-
 def setup_notion(parent_page_id):
     payload = {
-        "parent": {"type": "page_id", "page_id": parent_page_id},
-        "title": [{"type": "text", "text": {"content": "Bibliothèque personnelle"}}],
+        "parent": {"type":"page_id","page_id":parent_page_id},
+        "title":  [{"type":"text","text":{"content":"Bibliothèque personnelle"}}],
         "properties": {
-            "Name": {"title": {}},
-            "Content Type": {"select": {"options": [
-                {"name": "Article"}, {"name": "Livre"},
-                {"name": "Film"},    {"name": "Concept"},
-            ]}},
-            "Domain": {"select": {"options": [
-                {"name": "Technologie"}, {"name": "Science"}, {"name": "Philosophie"},
-                {"name": "Business"},    {"name": "Psychologie"}, {"name": "Histoire"},
-                {"name": "Art"},         {"name": "Santé"},      {"name": "Général"},
-            ]}},
-            "Author":       {"rich_text": {}},
-            "Year":         {"number": {}},
-            "Source":       {"url": {}},
-            "Tags":         {"multi_select": {}},
-            "Status": {"select": {"options": [
-                {"name": "À lire"}, {"name": "En cours"},
-                {"name": "Lu"},      {"name": "Archivé"},
-            ]}},
-            "Priority": {"select": {"options": [
-                {"name": "Haute"}, {"name": "Moyenne"}, {"name": "Basse"},
-            ]}},
-            "Date Consumed": {"date": {}},
+            "Name":         {"title":{}},
+            "Content Type": {"select":{"options":[{"name":"Article"},{"name":"Livre"},{"name":"Film"},{"name":"Concept"}]}},
+            "Domain":       {"select":{"options":[{"name":"Technologie"},{"name":"Science"},{"name":"Philosophie"},{"name":"Business"},{"name":"Psychologie"},{"name":"Histoire"},{"name":"Art"},{"name":"Santé"},{"name":"Général"}]}},
+            "Author":       {"rich_text":{}},
+            "Year":         {"number":{}},
+            "Source":       {"url":{}},
+            "Tags":         {"multi_select":{}},
+            "Status":       {"select":{"options":[{"name":"À lire"},{"name":"En cours"},{"name":"Lu"},{"name":"Archivé"}]}},
+            "Priority":     {"select":{"options":[{"name":"Haute"},{"name":"Moyenne"},{"name":"Basse"}]}},
+            "Date Consumed":{"date":{}},
         },
     }
-    r = requests.post(f"{_NOTION_API}/databases", headers=_notion_headers(), json=payload)
+    r  = requests.post(f"{_NOTION_API}/databases", headers=_notion_headers(), json=payload)
     r.raise_for_status()
     db = r.json()
-    print(f"✅ Base Notion créée")
-    print(f"   ID  : {db['id']}")
-    print(f"   URL : {db.get('url', '')}")
-    print(f"\nAjoute dans ton .env :")
-    print(f"   NOTION_DATABASE_ID={db['id']}")
+    print(f"✅ Base Notion créée\n   ID  : {db['id']}\n   URL : {db.get('url','')}")
+    print(f"\nAjoute dans ton .env :\n   NOTION_DATABASE_ID={db['id']}")
 
 
 # ─── Core pipeline ────────────────────────────────────────────────────────────
 
-def process(text):
-    """
-    Full pipeline. Returns (notion_url, from_cache, content_type, identifier).
-    content_type == 'ambiguous' → needs clarification, notion_url is None.
-    """
-    content_type, identifier = classify(text)
+logger = logging.getLogger(__name__)
 
+def process(text):
+    content_type, identifier = classify(text)
     if content_type == "ambiguous":
         return None, False, "ambiguous", identifier
 
-    ck = _cache_key(content_type, identifier)
+    ck    = _cache_key(content_type, identifier)
     cache = _load_cache()
     if ck in cache:
         return cache[ck]["notion_url"], True, content_type, identifier
 
     enriched = {}
+
     if content_type == "article":
         enriched["content"] = fetch_article(identifier)
+
     elif content_type == "article_search":
         enriched = fetch_article_by_keywords(identifier)
-    elif content_type == "torrent":
-        enriched["content"] = fetch_torrent(identifier)
+
+    elif content_type == "livre":
+        enriched = enrich_book(identifier)       # Google Books: title/author/isbn/year
+        try:
+            enriched["content"] = fetch_book_content(
+                enriched.get("title", identifier),
+                enriched.get("author", ""),
+                enriched.get("isbn",   ""),
+            )
+        except Exception as e:
+            logger.warning("Libgen indisponible (%s) — résumé sur métadonnées seules", e)
+
     elif content_type == "film":
         enriched = enrich_film(identifier)
-    elif content_type == "livre":
-        enriched = enrich_book(identifier)
+
+    elif content_type == "torrent":
+        enriched["content"] = fetch_torrent(identifier)
 
     summary = summarize_with_llm(content_type, identifier, enriched)
     if "best_quote" in summary:
         summary["best_quote"]["is_real_quote"] = False
-
-    # For article_search: prefer the URL found by web search as metadata source
     if content_type == "article_search" and enriched.get("url"):
         summary.setdefault("metadata", {})["source"] = enriched["url"]
 
     notion_url = _create_notion_page(NOTION_DATABASE_ID, summary)
-    cache[ck] = {"notion_url": notion_url, "created_at": datetime.now().isoformat()}
+    cache[ck]  = {"notion_url": notion_url, "created_at": datetime.now().isoformat()}
     _save_cache(cache)
-
     return notion_url, False, content_type, identifier
 
 
-# ─── Telegram bot ─────────────────────────────────────────────────────────────
+# ─── Telegram ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
 
 _HELP = (
     "Envoie-moi :\n"
-    "• Une URL d’article (fetch direct + Wayback fallback)\n"
+    "• URL d’article (fetch direct + Wayback fallback)\n"
     "• `article: politico - melanchon surge 2027`  → recherche web\n"
-    "• Un lien magnet ou fichier .torrent en PJ\n"
-    "• `film: <titre>` · `livre: <titre>` · `concept: <sujet>`\n\n"
+    "• `livre: Atomic Habits`  → Google Books + Libgen (texte complet)\n"
+    "• `film: Inception`  ·  `concept: biais cognitifs`\n"
+    "• Lien magnet ou fichier .torrent en PJ\n\n"
     "Ambiguïté : `film: Dune`  vs  `livre: Dune`"
 )
 
@@ -629,14 +619,12 @@ _LABELS = {
     "torrent":        "🧲 Torrent",
 }
 
-
 async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text or text in ("/start", "/help"):
         await update.message.reply_text(_HELP)
         return
     await _run_pipeline(update, text)
-
 
 async def _handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -646,15 +634,12 @@ async def _handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_file = await context.bot.get_file(doc.file_id)
     with tempfile.NamedTemporaryFile(suffix=".torrent", delete=False) as tmp:
         await tg_file.download_to_drive(tmp.name)
-        torrent_path = tmp.name
+        path = tmp.name
     try:
-        await _run_pipeline(update, torrent_path)
+        await _run_pipeline(update, path)
     finally:
-        try:
-            os.unlink(torrent_path)
-        except OSError:
-            pass
-
+        try: os.unlink(path)
+        except OSError: pass
 
 async def _run_pipeline(update: Update, text: str):
     await update.message.reply_text("⏳ Traitement en cours…")
@@ -665,25 +650,16 @@ async def _run_pipeline(update: Update, text: str):
         logger.exception("pipeline error")
         await update.message.reply_text(f"❌ Erreur : {exc}")
         return
-
     if content_type == "ambiguous":
         await update.message.reply_text(
-            f"❓ Ambiguïté : *{identifier}*\n\nPrécise le type :\n"
-            f"• `film: {identifier}`\n"
-            f"• `livre: {identifier}`\n"
-            f"• `concept: {identifier}`",
-            parse_mode="Markdown",
-        )
+            f"❓ Ambiguïté : *{identifier}*\n\nPrécise :\n"
+            f"• `film: {identifier}`\n• `livre: {identifier}`\n• `concept: {identifier}`",
+            parse_mode="Markdown")
         return
-
     elapsed = round(time.monotonic() - t0, 1)
-    note  = " *(cache)*" if from_cache else f" *({elapsed}s)*"
-    label = _LABELS.get(content_type, content_type)
-    await update.message.reply_text(
-        f"✅ {label}{note}\n{notion_url}",
-        parse_mode="Markdown",
-    )
-
+    label   = _LABELS.get(content_type, content_type)
+    note    = " *(cache)*" if from_cache else f" *({elapsed}s)*"
+    await update.message.reply_text(f"✅ {label}{note}\n{notion_url}", parse_mode="Markdown")
 
 def run_bot():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -696,11 +672,10 @@ def run_bot():
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Summarizer bot")
-    parser.add_argument(
-        "--setup", metavar="PARENT_PAGE_ID",
-        help="Créer la base de données Notion dans la page indiquée",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--setup", metavar="PARENT_PAGE_ID",
+                        help="Créer la base Notion")
     args = parser.parse_args()
     if args.setup:
         setup_notion(args.setup)
